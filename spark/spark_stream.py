@@ -4,8 +4,10 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
     from_json,
+    window,
     count,
     sum,
+    to_timestamp,
     coalesce,
     lit
 )
@@ -17,9 +19,9 @@ from pyspark.sql.types import (
     DoubleType
 )
 
-# ==============================
-# LOGGING
-# ==============================
+# ==========================================
+# LOGGING CONFIGURATION
+# ==========================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,9 +30,9 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# ==============================
+# ==========================================
 # CREATE SPARK SESSION
-# ==============================
+# ==========================================
 
 spark = SparkSession.builder \
     .appName("RealTimeEcommerceAnalytics") \
@@ -45,11 +47,15 @@ spark = SparkSession.builder \
     ) \
     .getOrCreate()
 
+# Reduce unnecessary logs
 spark.sparkContext.setLogLevel("ERROR")
 
-# ==============================
+# Reduce local shuffle partitions
+spark.conf.set("spark.sql.shuffle.partitions", "8")
+
+# ==========================================
 # DEFINE EVENT SCHEMA
-# ==============================
+# ==========================================
 
 schema = StructType() \
     .add("event_id", StringType()) \
@@ -63,30 +69,39 @@ schema = StructType() \
     .add("city", StringType()) \
     .add("timestamp", StringType())
 
-# ==============================
+# ==========================================
 # READ STREAM FROM KAFKA
-# ==============================
+# ==========================================
 
 logger.info("Reading stream from Kafka...")
 
 raw_df = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "user_events") \
-    .option("startingOffsets", "earliest") \
+    .option(
+        "kafka.bootstrap.servers",
+        "localhost:9092"
+    ) \
+    .option(
+        "subscribe",
+        "user_events"
+    ) \
+    .option(
+        "startingOffsets",
+        "earliest"
+    ) \
     .load()
 
-# ==============================
+# ==========================================
 # CONVERT KAFKA BYTES TO STRING
-# ==============================
+# ==========================================
 
 json_df = raw_df.selectExpr(
     "CAST(value AS STRING)"
 )
 
-# ==============================
+# ==========================================
 # PARSE JSON EVENTS
-# ==============================
+# ==========================================
 
 parsed_df = json_df.select(
     from_json(
@@ -95,28 +110,49 @@ parsed_df = json_df.select(
     ).alias("data")
 ).select("data.*")
 
-# ==============================
-# REAL-TIME AGGREGATION
-# ==============================
+# ==========================================
+# CONVERT TIMESTAMP COLUMN
+# ==========================================
 
-analytics_df = parsed_df.groupBy(
-    "event_type"
-).agg(
-    count("*").alias("event_count"),
-
-    coalesce(
-        sum("price"),
-        lit(0)
-    ).alias("total_revenue")
+parsed_df = parsed_df.withColumn(
+    "timestamp",
+    to_timestamp(col("timestamp"))
 )
 
-# ==============================
+# ==========================================
+# WINDOWED REAL-TIME AGGREGATION
+# ==========================================
+
+analytics_df = parsed_df \
+    .withWatermark("timestamp", "10 minutes") \
+    .groupBy(
+        window(col("timestamp"), "1 minute"),
+        col("event_type")
+    ).agg(
+
+        count("*").alias("event_count"),
+
+        coalesce(
+            sum("price"),
+            lit(0)
+        ).alias("total_revenue")
+    ) \
+    .select(
+        col("window.start").alias("window_start"),
+        col("window.end").alias("window_end"),
+        col("event_type"),
+        col("event_count"),
+        col("total_revenue")
+    )
+# ==========================================
 # WRITE TO POSTGRESQL
-# ==============================
+# ==========================================
 
 def write_to_postgres(batch_df, batch_id):
 
-    logger.info(f"Writing batch {batch_id} to PostgreSQL...")
+    logger.info(
+        f"Writing batch {batch_id} to PostgreSQL..."
+    )
 
     batch_df.write \
         .format("jdbc") \
@@ -143,28 +179,28 @@ def write_to_postgres(batch_df, batch_id):
         .mode("append") \
         .save()
 
-# ==============================
-# CONSOLE OUTPUT
-# ==============================
+# ==========================================
+# CONSOLE STREAM OUTPUT
+# ==========================================
 
 console_query = analytics_df.writeStream \
-    .outputMode("complete") \
+    .outputMode("update") \
     .format("console") \
     .option("truncate", False) \
     .start()
 
-# ==============================
-# POSTGRES STREAM
-# ==============================
+# ==========================================
+# POSTGRESQL STREAM OUTPUT
+# ==========================================
 
 postgres_query = analytics_df.writeStream \
     .outputMode("update") \
     .foreachBatch(write_to_postgres) \
     .start()
 
-# ==============================
+# ==========================================
 # KEEP STREAM RUNNING
-# ==============================
+# ==========================================
 
 logger.info("Spark streaming started...")
 
