@@ -38,20 +38,51 @@ spark = SparkSession.builder \
     .appName("RealTimeEcommerceAnalytics") \
     .master("local[*]") \
     .config(
-        "spark.jars.packages",
-        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
-    ) \
+    "spark.jars.packages",
+    ",".join([
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1",
+        "org.apache.hadoop:hadoop-aws:3.3.4"
+    ])
+    )\
     .config(
         "spark.jars",
         "../jars/postgresql-42.7.3.jar"
     ) \
     .getOrCreate()
 
-# Reduce unnecessary logs
 spark.sparkContext.setLogLevel("ERROR")
-
-# Reduce local shuffle partitions
 spark.conf.set("spark.sql.shuffle.partitions", "8")
+
+# ==========================================
+# MINIO CONFIGURATION
+# ==========================================
+
+hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+
+hadoop_conf.set(
+    "fs.s3a.access.key",
+    "admin"
+)
+
+hadoop_conf.set(
+    "fs.s3a.secret.key",
+    "password123"
+)
+
+hadoop_conf.set(
+    "fs.s3a.endpoint",
+    "http://localhost:9000"
+)
+
+hadoop_conf.set(
+    "fs.s3a.path.style.access",
+    "true"
+)
+
+hadoop_conf.set(
+    "fs.s3a.impl",
+    "org.apache.hadoop.fs.s3a.S3AFileSystem"
+)
 
 # ==========================================
 # DEFINE EVENT SCHEMA
@@ -120,18 +151,27 @@ parsed_df = parsed_df.withColumn(
 )
 
 # ==========================================
-# WINDOWED REAL-TIME AGGREGATION
+# SILVER LAYER
 # ==========================================
 
-analytics_df = parsed_df \
+silver_df = parsed_df \
+    .dropDuplicates(["event_id"]) \
+    .filter(
+        col("price").isNotNull()
+    )
+
+# ==========================================
+# ANALYTICS LAYER
+# ==========================================
+
+analytics_df = silver_df \
     .withWatermark("timestamp", "10 minutes") \
     .groupBy(
         window(col("timestamp"), "1 minute"),
         col("event_type")
-    ).agg(
-
+    ) \
+    .agg(
         count("*").alias("event_count"),
-
         coalesce(
             sum("price"),
             lit(0)
@@ -144,8 +184,34 @@ analytics_df = parsed_df \
         col("event_count"),
         col("total_revenue")
     )
+
 # ==========================================
-# WRITE TO POSTGRESQL
+# GOLD LAYER
+# ==========================================
+
+gold_df = silver_df \
+    .withWatermark("timestamp", "10 minutes") \
+    .groupBy(
+        window(col("timestamp"), "5 minutes"),
+        col("category")
+    ) \
+    .agg(
+        count("*").alias("total_events"),
+        coalesce(
+            sum("price"),
+            lit(0)
+        ).alias("total_sales")
+    ) \
+    .select(
+        col("window.start").alias("window_start"),
+        col("window.end").alias("window_end"),
+        col("category"),
+        col("total_events"),
+        col("total_sales")
+    )
+
+# ==========================================
+# POSTGRES WRITER
 # ==========================================
 
 def write_to_postgres(batch_df, batch_id):
@@ -180,26 +246,34 @@ def write_to_postgres(batch_df, batch_id):
         .save()
 
 # ==========================================
-# CONSOLE STREAM OUTPUT
+# CONSOLE STREAM
 # ==========================================
 
 console_query = analytics_df.writeStream \
-    .outputMode("update") \
+    .outputMode("complete") \
     .format("console") \
     .option("truncate", False) \
+    .option(
+        "checkpointLocation",
+        "../checkpoints/console"
+    ) \
     .start()
 
 # ==========================================
-# POSTGRESQL STREAM OUTPUT
+# POSTGRES STREAM
 # ==========================================
 
 postgres_query = analytics_df.writeStream \
     .outputMode("update") \
+    .option(
+        "checkpointLocation",
+        "../checkpoints/postgres"
+    ) \
     .foreachBatch(write_to_postgres) \
     .start()
 
 # ==========================================
-# KEEP STREAM RUNNING
+# START STREAMING
 # ==========================================
 
 logger.info("Spark streaming started...")
