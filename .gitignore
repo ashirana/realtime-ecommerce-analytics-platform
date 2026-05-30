@@ -1,13 +1,19 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
 
 # Virtual Environment
 venv/
 .venv/
 
-# Spark checkpoints
+# Spark
 checkpoints/
+spark-warehouse/
+metastore_db/
+
+# Logs
+*.log
 
 # Environment variables
 .env
@@ -15,3 +21,6 @@ checkpoints/
 # IDE
 .vscode/
 .idea/
+
+# OS files
+.DS_Store

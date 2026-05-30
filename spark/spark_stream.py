@@ -38,15 +38,13 @@ spark = SparkSession.builder \
     .appName("RealTimeEcommerceAnalytics") \
     .master("local[*]") \
     .config(
-    "spark.jars.packages",
-    ",".join([
-        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1",
-        "org.apache.hadoop:hadoop-aws:3.3.4"
-    ])
-    )\
-    .config(
-        "spark.jars",
-        "../jars/postgresql-42.7.3.jar"
+        "spark.jars.packages",
+        ",".join([
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1",
+            "org.apache.hadoop:hadoop-aws:3.3.4",
+            "com.amazonaws:aws-java-sdk-bundle:1.12.262",
+            "org.postgresql:postgresql:42.7.3"
+        ])
     ) \
     .getOrCreate()
 
@@ -59,24 +57,17 @@ spark.conf.set("spark.sql.shuffle.partitions", "8")
 
 hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
 
-hadoop_conf.set(
-    "fs.s3a.access.key",
-    "admin"
-)
+hadoop_conf.set("fs.s3a.access.key", "admin")
+hadoop_conf.set("fs.s3a.secret.key", "password123")
+
+hadoop_conf.set("fs.s3a.endpoint", "localhost:9000")
+hadoop_conf.set("fs.s3a.connection.ssl.enabled", "false")
+
+hadoop_conf.set("fs.s3a.path.style.access", "true")
 
 hadoop_conf.set(
-    "fs.s3a.secret.key",
-    "password123"
-)
-
-hadoop_conf.set(
-    "fs.s3a.endpoint",
-    "http://localhost:9000"
-)
-
-hadoop_conf.set(
-    "fs.s3a.path.style.access",
-    "true"
+    "fs.s3a.aws.credentials.provider",
+    "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
 )
 
 hadoop_conf.set(
@@ -270,6 +261,59 @@ postgres_query = analytics_df.writeStream \
         "../checkpoints/postgres"
     ) \
     .foreachBatch(write_to_postgres) \
+    .start()
+# ==========================================
+# BRONZE STREAM
+# ==========================================
+
+bronze_query = parsed_df.writeStream \
+    .format("parquet") \
+    .option(
+        "path",
+        "s3a://ecommerce-data-lake/bronze/events"
+    ) \
+    .option(
+        "checkpointLocation",
+        "../checkpoints/bronze"
+    ) \
+    .partitionBy("event_type") \
+    .outputMode("append") \
+    .start()
+
+# ==========================================
+# SILVER STREAM
+# ==========================================
+
+silver_query = silver_df.writeStream \
+    .format("parquet") \
+    .option(
+        "path",
+        "s3a://ecommerce-data-lake/silver/events"
+    ) \
+    .option(
+        "checkpointLocation",
+        "../checkpoints/silver"
+    ) \
+    .partitionBy("event_type") \
+    .outputMode("append") \
+    .start()
+
+# ==========================================
+# GOLD STREAM
+# ==========================================
+
+gold_query = gold_df.writeStream \
+    .format("parquet") \
+    .option(
+        "path",
+        "s3a://ecommerce-data-lake/gold/business_metrics"
+    ) \
+    .option(
+        "checkpointLocation",
+        "../checkpoints/gold"
+    ) \
+    .partitionBy("category") \
+    .outputMode("append") \
     .start()
 
 # ==========================================
